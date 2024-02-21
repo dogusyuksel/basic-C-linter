@@ -13,7 +13,10 @@
 #include <assert.h>
 #include <sys/queue.h>
 
+static bool glb_any_error_found = false;
 static char *restricted_list[] = {"#define", "typedef", "#include"};
+static char *skip_error = NULL;
+
 enum CHECK_RETURNS {
     SUCCESS,
     FAIL,
@@ -22,7 +25,7 @@ enum CHECK_RETURNS {
     GOTO
 };
 
-#define SKIP_KEYWORD            "BSCA_SKIP"
+#define VERSION                 "1.0.0"
 
 #define MAX_FUNCTION_CHAR_LEN   32768
 #define MAX_LINE_CHAR_LEN       1024
@@ -43,22 +46,29 @@ struct file_queue_entry {
 };
 TAILQ_HEAD(file_queue_head, file_queue_entry);
 
+struct stats {
+    unsigned int total_checked_file_count;
+    unsigned int total_checked_function_count;
+    unsigned int total_found_possible_leaks;
+};
+
 static struct option parameters[] = {
     { "help",           no_argument,        0,        'h'        },
     { "directory",      required_argument,  0,        'd'        },
     { "file",           required_argument,  0,        'f'        },
+    { "skip",           required_argument,  0,        's'        },
     { NULL,            0,                   0,         0         },
 };
 
-static void print_help_and_exit(char *app_name)
+static void print_help(char *app_name)
 {
     int i = 0;
 
     if (!app_name) {
-        exit(EXIT_FAILURE);
+        return;
     }
 
-    printf("usage of %s\n", app_name);
+    printf("usage of %s (version %s)\n", app_name, VERSION);
     while (parameters[i].name != NULL) {
         printf("\t--%s or -%c, %s\n", parameters[i].name, (char)parameters[i].val,
             (parameters[i].has_arg == no_argument) ? ("no_argument") :
@@ -66,8 +76,6 @@ static void print_help_and_exit(char *app_name)
                     ("optional_argument")));
         i++;
     }
-
-    exit(EXIT_FAILURE);
 }
 
 static bool is_dir_exist(char *directory)
@@ -406,7 +414,9 @@ static int find_functions_in_a_file(char *filename, struct function_queue_head *
         }
         if (!function_starting_found) {
             funct_entry = create_function_const_to_entry();
-            funct_entry->starting_line = line_number;
+            if (funct_entry) {
+                funct_entry->starting_line = line_number;
+            }
         }
         function_starting_found = true;
 
@@ -498,7 +508,7 @@ static enum CHECK_RETURNS check_exits(bool *word_check, int *word_counter,
 
 static int find_leaks_in_a_function(char *filename,
     unsigned int start_line, unsigned int end_line,
-    char *control_word, char *exiting_word)
+    char *control_word, char *exiting_word, unsigned int *err_cnt)
 {
     unsigned int line_number = 0;
     FILE *fs = NULL;
@@ -508,7 +518,8 @@ static int find_leaks_in_a_function(char *filename,
     int control_counter = 0;
     enum CHECK_RETURNS check = SUCCESS;
 
-    if (!filename || !control_word || !exiting_word) {
+    if (!filename || !control_word ||
+        !exiting_word || !err_cnt) {
         return EXIT_FAILURE;
     }
 
@@ -539,7 +550,7 @@ static int find_leaks_in_a_function(char *filename,
             continue;
         }
 
-        if (strstr(line_buffer, SKIP_KEYWORD)) {
+        if (skip_error && strstr(line_buffer, skip_error)) {
             continue;
         }
         remove_space(line_buffer);
@@ -565,9 +576,10 @@ cont:
     }
 
     if (control_counter > 0 && hit_control_word) {
-        printf("+++++++++++++++++++++ CAUTION =====================\n");
-        printf("\tBe careful about %s:%d function. Possible ->%s<- leak (%d)\n",
+        (*err_cnt)++;
+        fprintf(stderr, "  ==> Be careful about %s:%d function. Possible ->%s<- leak (%d)\n",
             filename, start_line, control_word, control_counter);
+        glb_any_error_found = true;
     }
 
     return EXIT_SUCCESS;
@@ -575,6 +587,7 @@ cont:
 
 static int find_leaks(struct file_queue_head *queue)
 {
+    struct stats stats;
     struct file_queue_entry *np = NULL;
     struct function_entry *fp = NULL;
 
@@ -582,26 +595,36 @@ static int find_leaks(struct file_queue_head *queue)
         return EXIT_FAILURE;
     }
 
+    memset(&stats, 0, sizeof(struct stats));
+
     TAILQ_FOREACH(np, queue, entries) {
-        printf("checking the file: %s\n", np->filename);
+        (stats.total_checked_file_count)++;
         TAILQ_FOREACH(fp, &(np->functions), entries) {
-            // if (find_leaks_in_a_function(np->filename,
-            //     fp->starting_line, fp->ending_line, "fopen(", "fclose(")) {
-            //     return EXIT_FAILURE;
-            // }
+            (stats.total_checked_function_count)++;
             if (find_leaks_in_a_function(np->filename,
-                fp->starting_line, fp->ending_line, "open(", "close(")) {
+                fp->starting_line, fp->ending_line, "open(", "close(",
+                &(stats.total_found_possible_leaks))) {
             }
             if (find_leaks_in_a_function(np->filename,
-                fp->starting_line, fp->ending_line, "malloc(", "free(")) {
+                fp->starting_line, fp->ending_line, "malloc(", "free(",
+                &(stats.total_found_possible_leaks))) {
             }
             if (find_leaks_in_a_function(np->filename,
-                fp->starting_line, fp->ending_line, "calloc(", "free(")) {
+                fp->starting_line, fp->ending_line, "calloc(", "free(",
+                &(stats.total_found_possible_leaks))) {
             }
             if (find_leaks_in_a_function(np->filename,
-                fp->starting_line, fp->ending_line, "pthread_mutex_lock(", "pthread_mutex_unlock(")) {
+                fp->starting_line, fp->ending_line, "pthread_mutex_lock(", "pthread_mutex_unlock(",
+                &(stats.total_found_possible_leaks))) {
             }
         }
+    }
+
+    if (stats.total_checked_file_count && stats.total_checked_function_count) {
+        fprintf(stderr, "\nSUMMARY:\n");
+        fprintf(stderr, "\tTotal Checked Files     :  %u\n", stats.total_checked_file_count);
+        fprintf(stderr, "\tTotal Checked Functions :  %u\n", stats.total_checked_function_count);
+        fprintf(stderr, "\tTotal Possible Leaks    :  %u\n", stats.total_found_possible_leaks);
     }
 
     return EXIT_SUCCESS;
@@ -609,15 +632,17 @@ static int find_leaks(struct file_queue_head *queue)
 
 int main(int argc, char **argv)
 {
+    int ret = EXIT_SUCCESS;
     int c, o;
     char *directory = NULL;
     char *file = NULL;
     struct file_queue_head head;
 
-    while ((c = getopt_long(argc, argv, "hd:f:", parameters, &o)) != -1) {
+    while ((c = getopt_long(argc, argv, "hd:f:s:", parameters, &o)) != -1) {
         switch (c) {
             case 'h':
-                print_help_and_exit(argv[0]);
+                print_help(argv[0]);
+                goto success;
             case 'd':
                 directory = strdup(optarg);
                 if (!directory) {
@@ -634,15 +659,23 @@ int main(int argc, char **argv)
                     PRINT_ERROR("strdup() failed");
                 }
                 break;
+            case 's':
+                skip_error = strdup(optarg);
+                if (!skip_error) {
+                    PRINT_ERROR("strdup() failed");
+                }
+                break;
             default:
                 PRINT_ERROR("option cannot be found");
-                print_help_and_exit(argv[0]);
+                print_help(argv[0]);
+                goto fail;
         }
     }
 
     if (!directory && !file) {
         PRINT_ERROR("you should point one directory or file out");
-        print_help_and_exit(argv[0]);
+        print_help(argv[0]);
+        goto fail;
     }
 
     TAILQ_INIT(&head);
@@ -650,26 +683,50 @@ int main(int argc, char **argv)
     if (directory) {
         if (find_files_in_directory(directory, &head)) {
             PRINT_ERROR("find_files_in_directory() failed");
-            print_help_and_exit(argv[0]);
+            print_help(argv[0]);
+            goto fail;
         }
     } else if (file) {
         add_filename_to_queue(file, &head);
     } else {
         PRINT_ERROR("you should point one directory or file out");
-        print_help_and_exit(argv[0]);
+        print_help(argv[0]);
+        goto fail;
     }
 
     if (find_functions(&head)) {
         PRINT_ERROR("find_functions() failed");
-        print_help_and_exit(argv[0]);
+        print_help(argv[0]);
+        goto fail;
     }
 
     if (find_leaks(&head)) {
         PRINT_ERROR("find_leaks() failed");
-        print_help_and_exit(argv[0]);
+        print_help(argv[0]);
+        goto fail;
     }
 
-    //print_queue(&head);
+    if (glb_any_error_found) {
+        goto fail;
+    }
+
+    goto success;
+
+fail:
+    ret = EXIT_FAILURE;
+
+success:
 
     free_queue(&head);
+    if (skip_error) {
+        free(skip_error);
+    }
+    if (file) {
+        free(file);
+    }
+    if (directory) {
+        free(directory);
+    }
+
+    return ret;
 }
